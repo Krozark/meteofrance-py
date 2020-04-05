@@ -8,6 +8,8 @@ import requests
 import datetime
 import string
 from bs4 import BeautifulSoup
+from pytz import timezone
+
 
 
 SEARCH_API = 'http://www.meteofrance.com/mf3-rpc-portlet/rest/lieu/facet/previsions/search/{}'
@@ -22,7 +24,7 @@ class meteofranceError(Exception):
 
 class meteofranceClient():
     """Client to fetch and parse data from Meteo-France"""
-    def __init__(self, postal_code, update=False, need_rain_forecast=True):
+    def __init__(self, postal_code, update=False, need_rain_forecast=True, include_today=False):
         """Initialize the client object."""
         self.postal_code = postal_code
         self._city_slug = False
@@ -31,6 +33,7 @@ class meteofranceClient():
         self._rain_available = False
         self._weather_html_soup = False
         self.need_rain_forecast = need_rain_forecast
+        self.include_today = include_today
         self._type = None
         self._data = {}
         self._init_codes()
@@ -48,10 +51,19 @@ class meteofranceClient():
         """Search and set city slug and insee code."""
         url = SEARCH_API.format(self.postal_code)
         try:
-            results = requests.get(url, timeout=10).json()
+            response = requests.get(url, timeout=10)
+            if response.history:
+                raise meteofranceError("Error: www.meteofrance.com is overloaded or in maintenance and return a redirection. Unable to get the data from the source.")
+        
+            elif response.status_code != 200:
+                raise meteofranceError("Error: www.meteofrance.com server return an unexpected status code (%s). Unable to get the data from source.", response.status_code)
+            
+            results = response.json()
+            
             for result in results:
                 if result["id"] and (result["type"] == "VILLE_FRANCE" or result["type"] == "VILLE_MONDE"):
                     self._insee_code = result["id"]
+                    self._data['insee_code']= self._insee_code
                     self._city_slug = result["slug"]
                     self._rain_available = result["pluieAvalaible"]
                     self._data["name"] = result["slug"].title()
@@ -60,6 +72,7 @@ class meteofranceClient():
                     self._type = result["type"]
                     if result["parent"] and result["parent"] and result["parent"]["type"] == "DEPT_FRANCE":
                         self._data["dept"] = result["parent"]["id"][4:]
+                        self._data["dept_name"] = result["parent"]["nomAffiche"]
                     return
             raise meteofranceError("Error: no forecast for the query `{}`".format(self.postal_code))
         except Exception as err:
@@ -111,6 +124,28 @@ class meteofranceClient():
             time_to_rain += 5
         return "No rain"
 
+    def _get_next_rain_datetime(self):
+        """Get the time of the next rain"""
+        # Convert the string in date and time with Europe/Paris timezone.
+        string_date = self._rain_forecast["echeance"]
+        annee = int(string_date[0:4])
+        mois = int(string_date[4:6])
+        jour = int(string_date[6:8])
+        heure = int(string_date[8:10])
+        minute = int(string_date[10:12])
+        paris_timezone = timezone("Europe/Paris")
+        cadran_start_time = paris_timezone.localize(
+            datetime.datetime(annee, mois, jour, heure, minute)
+        )
+
+        # Get the delay in minutes until next rain.
+        next_rain_delay = self._get_next_rain_time()
+        if next_rain_delay == "No rain":
+            return "No rain"
+        
+        # Else Compute the date of the next rain
+        return cadran_start_time + datetime.timedelta(minutes=int(next_rain_delay))
+        
     def _get_next_sun_time(self):
         """Get the minutes to the next sun"""
         time_to_sun = 0
@@ -126,8 +161,13 @@ class meteofranceClient():
             self._data["fetched_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rain_forecast = self._rain_forecast
             if rain_forecast is not False:
+                next_rain_datetime = self._get_next_rain_datetime()
                 self._data["rain_forecast"] = ''#rain_forecast["niveauPluieText"][0]
                 self._data["next_rain"] = self._get_next_rain_time()
+                if next_rain_datetime == "No rain":
+                    self._data["next_rain_datetime"] = "No rain"
+                else: 
+                    self._data["next_rain_datetime"] = next_rain_datetime.isoformat()
                 emojis = [' ','☀️','🌦','🌧','💦']
                 self._data["next_rain_intervals"] = {}
                 for interval in range(0, len(rain_forecast["dataCadran"])):
@@ -138,7 +178,7 @@ class meteofranceClient():
                 elif self._data["next_rain"] == 0:
                     self._data["rain_forecast_text"] = "Pluie pendant encore au moins {} min".format(self._get_next_sun_time())
                 else:
-                    self._data["rain_forecast_text"] = "Risque de pluie dans {} min".format(self._data["next_rain"])
+                    self._data["rain_forecast_text"] = "Risque de pluie à partir de {}".format(next_rain_datetime.strftime("%H:%M"))
             soup = self._weather_html_soup
             if soup is not False:
                 self._data["weather"] = soup.find(class_="day-summary-label").string.strip()
@@ -149,9 +189,9 @@ class meteofranceClient():
                     self._data["weather_class"] = None
 
                 try:
-                    self._data["temperature"] = int(re.sub("[^0-9\-]","",soup.find(class_="day-summary-temperature").string))
+                    self._data["temperature"] = int(re.sub(r"[^0-9\-]","",soup.find(class_="day-summary-temperature").string))
                 except: #weird class name of world pages
-                    self._data["temperature"] = int(re.sub("[^0-9\-]","",soup.find(class_="day-summary-temperature-outremer").string))
+                    self._data["temperature"] = int(re.sub(r"[^0-9\-]","",soup.find(class_="day-summary-temperature-outremer").string))
 
                 try:
                     self._data["wind_speed"] = int(next(soup.find(class_="day-summary-wind").stripped_strings).replace(' km/h', ''))
@@ -192,14 +232,17 @@ class meteofranceClient():
                         weather = daydata.find("dd").string
                         if weather:
                           forecast["weather"] = weather.strip()
-                          min_temp = re.sub("[^0-9\-]","",daydata.find(class_="min-temp").string)
+                          min_temp = re.sub(r"[^0-9\-]","",daydata.find(class_="min-temp").string)
                           if min_temp != '-':
                             forecast["min_temp"] = int(min_temp)
-                          max_temp = re.sub("[^0-9\-]","",daydata.find(class_="max-temp").string)
+                          max_temp = re.sub(r"[^0-9\-]","",daydata.find(class_="max-temp").string)
                           if max_temp != '-':
                             forecast["max_temp"] = int(max_temp)
                           forecast["weather_class"] = daydata.find("dd").attrs['class'][1]
-                          self._data["forecast"][day] = forecast
+                          if self.include_today:
+                            self._data["forecast"][day] = forecast
+                          elif day > 0 and day < 6:
+                            self._data["forecast"][day-1] = forecast
                         day = day + 1
                     except:
                         raise
