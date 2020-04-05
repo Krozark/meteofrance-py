@@ -5,8 +5,8 @@ setup(
     version='0.3.9',
     description = 'Meteo-France weather forecast',
     author = 'victorcerutti',
-    author_email = 'victorcerutti+meteofrance@gmail.com',
-    url = 'https://github.com/victorcerutti/meteofrance-py',
+    author_email = 'maxime.barbier1991+meteofrance@gmail.com',
+    url = 'https://github.com/Krozark/meteofrance-py',
     packages=['meteofrance',],
     install_requires=[
        'requests',
